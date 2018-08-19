@@ -6,3 +6,4 @@ authors = ["Dmitrii Goriunov <goriunovd@gmail.com>"]
 [dependencies]
 fnv = "1.0.6"
 mio = "0.6"
+http-muncher = "0.3"

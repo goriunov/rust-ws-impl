@@ -1,17 +1,48 @@
 extern crate fnv;
+extern crate http_muncher;
 extern crate mio;
 
-use std::io::{Read, Write};
-
 use fnv::FnvHashMap;
+use http_muncher::{Parser, ParserHandler};
 use mio::tcp::{Shutdown, TcpListener, TcpStream};
 use mio::*;
+use std::io::{Read, Write};
+
+struct HttpHeaders {
+    headers: FnvHashMap<String, String>,
+    field: String,
+    value: String,
+}
+
+impl HttpHeaders {
+    fn get_all_headers(self) -> FnvHashMap<String, String> {
+        self.headers
+    }
+}
+
+impl ParserHandler for HttpHeaders {
+    fn on_header_field(&mut self, _: &mut Parser, header: &[u8]) -> bool {
+        self.field = String::from_utf8(header.to_vec()).unwrap();
+        true
+    }
+    fn on_header_value(&mut self, _: &mut Parser, value: &[u8]) -> bool {
+        self.value = String::from_utf8(value.to_vec()).unwrap();
+        if !self.field.is_empty() && !self.value.is_empty() {
+            self.headers.insert(self.field.clone(), self.value.clone());
+            // reset values
+            self.field = String::new();
+            self.value = String::new();
+        }
+        true
+    }
+}
 
 struct WebSocketClient {
     socket: TcpStream,
     interest: Ready,
     read_buf: Vec<u8>,
     hangs: u8,
+    headers: FnvHashMap<String, String>,
 }
 
 impl WebSocketClient {
@@ -19,6 +50,7 @@ impl WebSocketClient {
         WebSocketClient {
             socket,
             hangs: 0,
+            headers: FnvHashMap::default(),
             interest: Ready::readable(),
             read_buf: Vec::with_capacity(1024),
         }
@@ -37,7 +69,26 @@ impl WebSocketClient {
                     self.hangs = 0;
                     self.read_buf.extend_from_slice(&buf[..n]);
                     // implement header parse function
-                    println!("{:?}", std::str::from_utf8(&self.read_buf).unwrap());
+
+                    let buf_len = self.read_buf.len();
+
+                    // check if full headers are loaded
+                    // need to write own headers parser
+                    if buf_len > 3 && &self.read_buf[buf_len - 4..] == b"\r\n\r\n" {
+                        let mut parser = Parser::request();
+                        let mut http_headers = HttpHeaders {
+                            headers: FnvHashMap::default(),
+                            field: String::new(),
+                            value: String::new(),
+                        };
+
+                        parser.parse(&mut http_headers, &self.read_buf[..]);
+                        self.headers = http_headers.get_all_headers();
+
+                        println!("{:#?}", self.headers);
+                    }
+
+                    // println!("{:?}", std::str::from_utf8(&self.read_buf).unwrap());
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // println!("Got in here with error");
