@@ -1,0 +1,8 @@
+[package]
+name = "simple-socket"
+version = "0.1.0"
+authors = ["Dmitrii Goriunov <goriunovd@gmail.com>"]
+
+[dependencies]
+fnv = "1.0.6"
+mio = "0.6"
