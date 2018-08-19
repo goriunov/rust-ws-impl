@@ -7,20 +7,18 @@ use fnv::FnvHashMap;
 use mio::tcp::{Shutdown, TcpListener, TcpStream};
 use mio::*;
 
-// const SERVER: Token = Token(0);
-
 struct WebSocketClient {
     socket: TcpStream,
     interest: Ready,
     read_buf: Vec<u8>,
-    hung: u8,
+    hangs: u8,
 }
 
 impl WebSocketClient {
     fn new(socket: TcpStream) -> Self {
         WebSocketClient {
             socket,
-            hung: 0,
+            hangs: 0,
             interest: Ready::readable(),
             read_buf: Vec::with_capacity(1024),
         }
@@ -32,17 +30,17 @@ impl WebSocketClient {
         loop {
             match self.socket.read(&mut buf) {
                 Ok(0) => {
-                    // record one hung from the client
-                    self.hung += 1;
+                    self.hangs += 1;
                     break;
                 }
                 Ok(n) => {
-                    self.hung = 0;
+                    self.hangs = 0;
                     self.read_buf.extend_from_slice(&buf[..n]);
+                    // implement header parse function
                     println!("{:?}", std::str::from_utf8(&self.read_buf).unwrap());
-                    // break;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // println!("Got in here with error");
                     break;
                 }
                 Err(e) => {
@@ -55,18 +53,18 @@ impl WebSocketClient {
 }
 
 struct WebsocketServer {
-    clients: FnvHashMap<Token, WebSocketClient>,
     server: TcpListener,
-    token: Token,
     counter: usize,
+    clients: FnvHashMap<Token, WebSocketClient>,
 }
 
 impl WebsocketServer {
+    const TOKEN: Token = Token(0);
+
     fn new(addr: std::net::SocketAddr) -> Self {
         let server = TcpListener::bind(&addr).expect("Could not bind to port");
 
         WebsocketServer {
-            token: Token(0),
             server,
             counter: 0,
             clients: FnvHashMap::default(),
@@ -76,11 +74,15 @@ impl WebsocketServer {
     fn start(&mut self) {
         let poll = mio::Poll::new().unwrap();
 
-        poll.register(&self.server, self.token, Ready::readable(), PollOpt::edge())
-            .unwrap();
+        poll.register(
+            &self.server,
+            WebsocketServer::TOKEN,
+            Ready::readable(),
+            PollOpt::edge(),
+        ).unwrap();
 
         let mut events = Events::with_capacity(1024);
-        println!("Server is running");
+        println!("Server is running on {}", self.server.local_addr().unwrap());
 
         loop {
             poll.poll(&mut events, None).unwrap();
@@ -88,7 +90,7 @@ impl WebsocketServer {
             for event in events.iter() {
                 let readiness = event.readiness();
                 match event.token() {
-                    Token(0) => match self.server.accept() {
+                    WebsocketServer::TOKEN => match self.server.accept() {
                         Ok((socket, _)) => {
                             self.counter += 1;
                             let new_token = Token(self.counter);
@@ -106,12 +108,9 @@ impl WebsocketServer {
                     },
                     Token(c) => {
                         let token = Token(c);
-                        let mut hungs;
-                        {
-                            hungs = self.clients.get(&token).unwrap().hung;
-                        }
+                        let is_hanged: bool = self.clients.get(&token).unwrap().hangs > 5;
 
-                        if hungs >= 5 {
+                        if is_hanged {
                             let client = self.clients.remove(&token).unwrap();
                             client.socket.shutdown(Shutdown::Both).unwrap();
                             poll.deregister(&client.socket).unwrap();
@@ -124,6 +123,8 @@ impl WebsocketServer {
                                 client.interest,
                                 PollOpt::edge() | PollOpt::oneshot(),
                             ).unwrap();
+                        } else if readiness.is_writable() {
+
                         }
                     }
                 }
@@ -133,7 +134,6 @@ impl WebsocketServer {
 }
 
 fn main() {
-    let addr = "127.0.0.1:3000".parse().unwrap();
-    let mut server = WebsocketServer::new(addr);
+    let mut server = WebsocketServer::new("127.0.0.1:3000".parse().unwrap());
     server.start();
 }
