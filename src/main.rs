@@ -4,8 +4,10 @@ extern crate mio;
 use std::io::{Read, Write};
 
 use fnv::FnvHashMap;
-use mio::net::{TcpListener, TcpStream};
+use mio::tcp::{Shutdown, TcpListener, TcpStream};
 use mio::*;
+
+// const SERVER: Token = Token(0);
 
 struct WebSocketClient {
     socket: TcpStream,
@@ -38,6 +40,9 @@ impl WebSocketClient {
                     self.hung = 0;
                     self.read_buf.extend_from_slice(&buf[..n]);
                     println!("{:?}", std::str::from_utf8(&self.read_buf).unwrap());
+                    // break;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;
                 }
                 Err(e) => {
@@ -49,68 +54,86 @@ impl WebSocketClient {
     }
 }
 
-const SERVER: Token = Token(0);
+struct WebsocketServer {
+    clients: FnvHashMap<Token, WebSocketClient>,
+    server: TcpListener,
+    token: Token,
+    counter: usize,
+}
 
-fn main() {
-    let mut counter = 0;
-    let addr = "127.0.0.1:3000".parse().unwrap();
-    let server = TcpListener::bind(&addr).expect("Could not bind to port");
+impl WebsocketServer {
+    fn new(addr: std::net::SocketAddr) -> Self {
+        let server = TcpListener::bind(&addr).expect("Could not bind to port");
 
-    let poll = mio::Poll::new().unwrap();
+        WebsocketServer {
+            token: Token(0),
+            server,
+            counter: 0,
+            clients: FnvHashMap::default(),
+        }
+    }
 
-    let mut clients: FnvHashMap<Token, WebSocketClient> = FnvHashMap::default();
+    fn start(&mut self) {
+        let poll = mio::Poll::new().unwrap();
 
-    poll.register(&server, SERVER, Ready::readable(), PollOpt::edge())
-        .unwrap();
+        poll.register(&self.server, self.token, Ready::readable(), PollOpt::edge())
+            .unwrap();
 
-    let mut events = Events::with_capacity(1024);
+        let mut events = Events::with_capacity(1024);
+        println!("Server is running");
 
-    loop {
-        poll.poll(&mut events, None).unwrap();
+        loop {
+            poll.poll(&mut events, None).unwrap();
 
-        for event in events.iter() {
-            let readness = event.readiness();
-            match event.token() {
-                SERVER => match server.accept() {
-                    Ok((socket, _)) => {
-                        counter += 1;
-                        let new_token = Token(counter);
-                        clients.insert(new_token, WebSocketClient::new(socket));
+            for event in events.iter() {
+                let readiness = event.readiness();
+                match event.token() {
+                    Token(0) => match self.server.accept() {
+                        Ok((socket, _)) => {
+                            self.counter += 1;
+                            let new_token = Token(self.counter);
 
-                        poll.register(
-                            &clients[&new_token].socket,
-                            new_token,
-                            Ready::readable(),
-                            PollOpt::edge() | PollOpt::oneshot(),
-                        ).unwrap();
-                    }
-                    Err(e) => {
-                        println!("Accept error: {}", e);
-                    }
-                },
-                Token(c) => {
-                    let token = Token(c);
-                    let mut hungs;
-                    // get status of the hungs
-                    {
-                        hungs = clients.get(&token).unwrap().hung;
-                    }
-                    // handle if client hungs on loop
-                    if hungs >= 5 {
-                        let client = clients.remove(&token).unwrap();
-                        poll.deregister(&client.socket).unwrap();
-                    } else if readness.is_readable() {
-                        let mut client = clients.get_mut(&token).unwrap();
-                        client.read();
-                        poll.reregister(
-                            &client.socket,
-                            token,
-                            client.interest,
-                            PollOpt::edge() | PollOpt::oneshot(),
-                        ).unwrap();
+                            poll.register(
+                                &socket,
+                                new_token,
+                                Ready::readable(),
+                                PollOpt::edge() | PollOpt::oneshot(),
+                            ).unwrap();
+
+                            self.clients.insert(new_token, WebSocketClient::new(socket));
+                        }
+                        Err(e) => println!("Error during connection {}", e),
+                    },
+                    Token(c) => {
+                        let token = Token(c);
+                        let mut hungs;
+                        {
+                            hungs = self.clients.get(&token).unwrap().hung;
+                        }
+
+                        if hungs >= 5 {
+                            let client = self.clients.remove(&token).unwrap();
+                            client.socket.shutdown(Shutdown::Both).unwrap();
+                            poll.deregister(&client.socket).unwrap();
+                        } else if readiness.is_readable() {
+                            let mut client = self.clients.get_mut(&token).unwrap();
+                            client.read();
+                            poll.reregister(
+                                &client.socket,
+                                token,
+                                client.interest,
+                                PollOpt::edge() | PollOpt::oneshot(),
+                            ).unwrap();
+                        }
                     }
                 }
             }
         }
     }
+}
+
+fn main() {
+    let addr = "127.0.0.1:3000".parse().unwrap();
+    let mut server = WebsocketServer::new(addr);
+    server.start();
 }
