@@ -1,92 +1,103 @@
-use client::WebSocketClient;
-use fnv::FnvHashMap;
-use std;
-
 use mio;
-use mio::tcp::{Shutdown, TcpListener};
+use mio::tcp::{Shutdown, TcpStream};
 use mio::*;
 
+use std;
+use std::io::ErrorKind;
+use std::io::{Read, Write};
+
+use fnv::FnvHashMap;
+
 pub struct WebsocketServer {
-    server: TcpListener,
-    counter: usize,
-    clients: FnvHashMap<Token, WebSocketClient>,
+    server: mio::net::TcpListener,
+    on_open: fn(i32),
+    on_message: fn([u8; 2048]),
+    clients: FnvHashMap<Token, TcpStream>,
 }
 
 impl WebsocketServer {
-    const TOKEN: Token = Token(0);
+    const token: Token = Token(0);
 
-    pub fn new(addr: std::net::SocketAddr) -> Self {
-        let server = TcpListener::bind(&addr).expect("Could not bind to port");
-
+    pub fn new(addr: std::net::SocketAddr) -> WebsocketServer {
+        let server = mio::net::TcpListener::bind(&addr).expect("Could not bind server");
         WebsocketServer {
             server,
-            counter: 0,
+            on_open: |_| {},
+            on_message: |_| {},
             clients: FnvHashMap::default(),
         }
     }
 
     pub fn start(&mut self) {
         let poll = mio::Poll::new().unwrap();
-
+        let mut count = 0;
         poll.register(
             &self.server,
-            WebsocketServer::TOKEN,
+            WebsocketServer::token,
             Ready::readable(),
             PollOpt::edge(),
         ).unwrap();
 
         let mut events = Events::with_capacity(1024);
-        println!("Server is running on {}", self.server.local_addr().unwrap());
 
         loop {
             poll.poll(&mut events, None).unwrap();
+            for e in &events {
+                let token = e.token();
 
-            for event in events.iter() {
-                let readiness = event.readiness();
-                match event.token() {
-                    WebsocketServer::TOKEN => match self.server.accept() {
-                        Ok((socket, _)) => {
-                            self.counter += 1;
-                            let new_token = Token(self.counter);
+                match token {
+                    WebsocketServer::token => loop {
+                        match self.server.accept() {
+                            Ok((socket, _)) => {
+                                count += 1;
+                                let new_token = Token(count);
 
-                            poll.register(
-                                &socket,
-                                new_token,
-                                Ready::readable(),
-                                PollOpt::edge() | PollOpt::oneshot(),
-                            ).unwrap();
+                                poll.register(
+                                    &socket,
+                                    new_token,
+                                    Ready::readable(),
+                                    PollOpt::edge(),
+                                ).unwrap();
 
-                            self.clients.insert(new_token, WebSocketClient::new(socket));
-                        }
-                        Err(e) => println!("Error during connection {}", e),
-                    },
-                    Token(c) => {
-                        let token = Token(c);
-                        let is_hanged: bool = self.clients.get(&token).unwrap().hangs > 3;
-
-                        if is_hanged {
-                            let client = self.clients.remove(&token).unwrap();
-                            client.socket.shutdown(Shutdown::Both).unwrap();
-                            poll.deregister(&client.socket).unwrap();
-                        } else if readiness.is_writable() || readiness.is_readable() {
-                            let mut client = self.clients.get_mut(&token).unwrap();
-
-                            if readiness.is_writable() {
-                                client.write()
-                            } else {
-                                client.read();
+                                self.clients.insert(new_token, socket);
                             }
-
-                            poll.reregister(
-                                &client.socket,
-                                token,
-                                client.interest,
-                                PollOpt::edge() | PollOpt::oneshot(),
-                            ).unwrap();
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(_e) => println!("Server error"),
                         }
+                    },
+                    Token(_) => {
+                        let mut buf = [0; 2048];
+
+                        let stream_close = loop {
+                            let mut client = self.clients.get_mut(&token).unwrap();
+                            match client.read(&mut buf) {
+                                Ok(0) => break true,
+                                Ok(_) => break false,
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break false,
+                                Err(ref e) if e.kind() == ErrorKind::ConnectionReset => break true,
+                                Err(_e) => break true,
+                            }
+                        };
+
+                        if stream_close {
+                            let client = self.clients.remove(&token).unwrap();
+                            client.shutdown(Shutdown::Both).unwrap();
+                            continue;
+                        }
+
+
+                        (self.on_message)(buf);
                     }
                 }
             }
         }
+    }
+
+    pub fn on_open(&mut self, calback: fn(i32)) {
+        self.on_open = calback;
+    }
+
+    pub fn on_message(&mut self, calback: fn([u8; 2048])) {
+        self.on_message = calback;
     }
 }

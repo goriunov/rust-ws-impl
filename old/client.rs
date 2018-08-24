@@ -64,6 +64,33 @@ impl WebSocketClient {
         self.interest.insert(Ready::readable());
     }
 
+    pub fn read_handshake(&mut self, n: usize, buf: [u8; 1024]) {
+        self.read_buf.extend_from_slice(&buf[..n]);
+        // implement header parse function
+
+        let buf_len = self.read_buf.len();
+
+        // check if full headers are loaded
+        // need to write own headers parser
+        if buf_len > 3 && &self.read_buf[buf_len - 4..] == b"\r\n\r\n" {
+            let mut parser = Parser::request();
+            let mut http_headers = HttpHeaders::new();
+
+            parser.parse(&mut http_headers, &self.read_buf[..]);
+            self.headers = http_headers.get_all_headers();
+
+            // print all headers
+            println!("{:#?}", self.headers);
+
+            // check if we have upgrade request
+            if parser.is_upgrade() {
+                self.state = WebsocketState::HandshakeResponse;
+                self.interest.remove(Ready::readable());
+                self.interest.insert(Ready::writable());
+            }
+        }
+    }
+
     pub fn read(&mut self) {
         let mut buf = [0; 1024];
 
@@ -75,30 +102,12 @@ impl WebSocketClient {
                 }
                 Ok(n) => {
                     self.hangs = 0;
-                    self.read_buf.extend_from_slice(&buf[..n]);
-                    // implement header parse function
-
-                    let buf_len = self.read_buf.len();
-
-                    // check if full headers are loaded
-                    // need to write own headers parser
-                    if buf_len > 3 && &self.read_buf[buf_len - 4..] == b"\r\n\r\n" {
-                        let mut parser = Parser::request();
-                        let mut http_headers = HttpHeaders::new();
-
-                        parser.parse(&mut http_headers, &self.read_buf[..]);
-                        self.headers = http_headers.get_all_headers();
-
-                        // print all headers
-                        println!("{:#?}", self.headers);
-
-                        // check if we have upgrade request
-                        if parser.is_upgrade() {
-                            self.state = WebsocketState::HandshakeResponse;
-                            self.interest.remove(Ready::readable());
-                            self.interest.insert(Ready::writable());
+                    match self.state {
+                        WebsocketState::AwaitingHandshake => {
+                            self.read_handshake(n, buf);
+                            break;
                         }
-                        break;
+                        _ => {}
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
