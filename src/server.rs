@@ -5,21 +5,22 @@ use slab::*;
 
 use std;
 use std::io::{ErrorKind, Read, Write};
+use std::*;
+
+use client::SocketClient;
 
 pub struct SocketServer {
-    is_set: bool,
     listener: TcpListener,
-    clients: Slab<TcpStream>,
+    clients: Slab<SocketClient>,
 }
 
 impl SocketServer {
-    const TOKEN: Token = Token(0);
+    const TOKEN: Token = Token(std::usize::MAX - 1);
     pub fn new(addr: std::net::SocketAddr) -> SocketServer {
         let listener = TcpListener::bind(&addr).expect("Could not bind server");
         SocketServer {
             listener,
             clients: Slab::with_capacity(2048),
-            is_set: false,
         }
     }
 
@@ -35,7 +36,7 @@ impl SocketServer {
 
         let mut events = Events::with_capacity(1024);
 
-        loop {
+        'next: loop {
             poll.poll(&mut events, None).unwrap();
 
             for e in &events {
@@ -45,95 +46,63 @@ impl SocketServer {
                 match token {
                     SocketServer::TOKEN => {
                         if readiness.is_readable() {
-                            let (mut sock, _addr) = self.listener.accept().unwrap();
-
-                            // wee need to put fake stuff in to the slab in position 0
-                            if !self.is_set {
-                                {
-                                    let entry = self.clients.vacant_entry();
-                                    let token: usize = entry.key().into();
-
-                                    if token == 0 {
-                                        let sokce_clone = sock.try_clone().unwrap();
-                                        entry.insert(sokce_clone);
-                                        self.is_set = true;
-                                    }
-                                }
-                            }
+                            let (mut sock, _addr) =
+                                self.listener.accept().expect("Could not get socket");
 
                             let entry = self.clients.vacant_entry();
                             let token = entry.key().into();
 
-                            poll.register(
-                                &sock,
-                                token,
-                                Ready::readable() | Ready::writable(),
-                                PollOpt::edge() | PollOpt::oneshot(),
-                            ).unwrap();
+                            poll.register(&sock, token, Ready::readable(), PollOpt::edge())
+                                .expect("Could not register socket");
 
-                            entry.insert(sock);
+                            entry.insert(SocketClient::new(sock));
                         }
                     }
                     Token(_) => {
                         let mut client = self.clients.remove(token.into());
-                        let mut done_read = false;
+
+                        // fix this part from the websocket system
                         if readiness.is_readable() {
-                            let mut buf = [0; 1024];
-                            let mut new_vec = Vec::with_capacity(1024);
-                            let die = loop {
-                                match client.read(&mut buf) {
-                                    Ok(0) => break true,
-                                    Ok(n) => {
-                                        // println!("{:#?}", std::str::from_utf8(&buf).unwrap());
-                                        new_vec.extend_from_slice(&buf[..n]);
-                                    }
-                                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break false,
-                                    Err(_e) => break false,
-                                }
-                            };
+                            let stream_closed = client.read_handshake();
 
-                            if die {
-                                println!("killing socket: {:?}", token);
-                                continue;
+                            if stream_closed {
+                                client.terminate();
+                                continue 'next;
                             }
 
-                            let buf_len = new_vec.len();
-                            if buf_len > 3 && &new_vec[buf_len - 4..] == b"\r\n\r\n" {
-                                println!("{:#?}", std::str::from_utf8(&new_vec).unwrap());
-                                done_read = true;
+                            // set done reading write proper header parser
+                            let filled_buf = &client.read_write.read_buf;
+                            let buf_len = filled_buf.len();
+                            if buf_len > 3 && &filled_buf[buf_len - 4..] == b"\r\n\r\n" {
+                                println!("{:#?}", str::from_utf8(&filled_buf).unwrap());
+                                client.read_write.done_read = true;
                             }
                         }
-                        let mut done_write = false;
-                        if readiness.is_writable() && done_read {
-                            let write_buf = b"HTTP/1.1 200 OK\r\nServer: HttpMio\r\n\r\n".to_vec();
 
-                            loop {
-                                match client.write(&write_buf[..]) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        done_write = true;
-                                        // need to handle state of the data
-                                        // break;
-                                        // socket.bytes_written += n;
-                                    }
-                                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                                    Err(e) => {
-                                        panic!("{:?}", e);
-                                        // break;
-                                    }
-                                }
+                        if readiness.is_writable() && client.read_write.done_read {
+                            if client.read_write.write_buf.is_empty() {
+                                client.read_write.write_buf =
+                                    b"HTTP/1.1 200 OK\r\nServer: HttpMio\r\n\r\n".to_vec();
+                                client
+                                    .read_write
+                                    .write_buf
+                                    .extend_from_slice(&client.read_write.read_buf);
                             }
-                            println!("{}", done_write);
+
+                            client.write_handshake();
+
+                            client.read_write.done_write = client.read_write.write_buf.len()
+                                == client.read_write.written_bytes;
                         }
 
-                        if !done_write {
+                        if !client.read_write.done_write {
                             let entry = self.clients.vacant_entry();
                             let token = entry.key().into();
                             poll.reregister(
-                                &client,
+                                &client.stream,
                                 token,
                                 Ready::readable() | Ready::writable(),
-                                PollOpt::edge() | PollOpt::oneshot(),
+                                PollOpt::edge(),
                             ).unwrap();
 
                             entry.insert(client);
