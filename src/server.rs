@@ -52,13 +52,18 @@ impl SocketServer {
                             let entry = self.clients.vacant_entry();
                             let token = entry.key().into();
 
-                            poll.register(&sock, token, Ready::readable(), PollOpt::edge())
-                                .expect("Could not register socket");
+                            poll.register(
+                                &sock,
+                                token,
+                                Ready::readable() | Ready::writable(),
+                                PollOpt::edge() | PollOpt::oneshot(),
+                            ).expect("Could not register socket");
 
                             entry.insert(SocketClient::new(sock));
                         }
                     }
                     Token(_) => {
+                        // handle http request connections
                         let mut client = self.clients.remove(token.into());
 
                         // fix this part from the websocket system
@@ -80,13 +85,10 @@ impl SocketServer {
                         }
 
                         if readiness.is_writable() && client.read_write.done_read {
+                            // write default response
                             if client.read_write.write_buf.is_empty() {
                                 client.read_write.write_buf =
-                                    b"HTTP/1.1 200 OK\r\nServer: HttpMio\r\n\r\n".to_vec();
-                                client
-                                    .read_write
-                                    .write_buf
-                                    .extend_from_slice(&client.read_write.read_buf);
+                                    b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec();
                             }
 
                             client.write_handshake();
@@ -102,7 +104,7 @@ impl SocketServer {
                                 &client.stream,
                                 token,
                                 Ready::readable() | Ready::writable(),
-                                PollOpt::edge(),
+                                PollOpt::edge() | PollOpt::oneshot(),
                             ).unwrap();
 
                             entry.insert(client);
