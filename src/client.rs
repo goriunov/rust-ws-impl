@@ -1,4 +1,5 @@
 use mio::tcp::{Shutdown, TcpListener, TcpStream};
+
 use std;
 use std::io::{ErrorKind, Read, Write};
 
@@ -29,42 +30,54 @@ impl SocketClient {
         }
     }
 
-    pub fn read_handshake(&mut self) -> bool {
-        let mut buf = [0; 256];
+    pub fn read(&mut self) -> bool {
+        let mut buf = [0; 1024];
 
-        let socket_closed = loop {
+        // note this loop is returned
+        loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => break true,
                 Ok(n) => {
                     self.read_write.read_buf.extend_from_slice(&buf[..n]);
-                    // println!("{:#?}", std::str::from_utf8(&buf).unwrap())
-                    // socket.read_buf.extend_from_slice(&buf[..n]);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break false,
-                Err(_) => break false,
+                Err(_) => break true,
             }
-        };
-
-        socket_closed
+        }
     }
 
-    pub fn write_handshake(&mut self) {
-        loop {
+    pub fn send_text(&mut self, msg: String) {
+        self.read_write.written_bytes = 0;
+        self.read_write.write_buf = msg.into_bytes().to_vec();
+        self.write();
+    }
+
+    pub fn send_vec(&mut self, msg: Vec<u8>) {
+        self.read_write.written_bytes = 0;
+        self.read_write.write_buf = msg;
+        self.write();
+    }
+
+    pub fn write(&mut self) {
+        // note this loop is returned
+        let closed = loop {
             match self
                 .stream
                 .write(&self.read_write.write_buf[self.read_write.written_bytes..])
             {
-                Ok(0) => break,
+                Ok(0) => break false,
                 Ok(n) => {
                     self.read_write.written_bytes += n;
                 }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break false,
                 Err(e) => {
                     // panic!("{:?}", e);
-                    break;
+                    break true;
                 }
             }
-        }
+        };
+
+        if closed {}
     }
 
     pub fn terminate(&mut self) {
